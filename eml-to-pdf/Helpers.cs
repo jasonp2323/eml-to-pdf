@@ -16,10 +16,61 @@ internal static class Helpers
     private static readonly HashSet<string> ReservedPaths = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Makes sure a local Chromium exists, downloading it on first run, and returns
-    /// the path to its executable. Throws with a readable message if that fails.
+    /// Picks the browser used for rendering. An already-installed Edge/Chrome is
+    /// strongly preferred: it is code-signed and already trusted by endpoint
+    /// security, whereas a downloaded Chrome for Testing build is unsigned and
+    /// runs from a user-writable directory, which tends to draw EDR attention.
+    /// Falls back to downloading Chromium when no local browser is found.
     /// </summary>
-    public static async Task<string> EnsureChromiumAsync()
+    public static async Task<BrowserChoice> ResolveBrowserAsync()
+    {
+        foreach (var (name, path) in CandidateBrowsers())
+        {
+            if (File.Exists(path))
+                return new BrowserChoice(path, $"{name} ({path})");
+        }
+
+        Console.WriteLine("No installed Edge/Chrome found; falling back to a downloaded Chromium.");
+        return await DownloadChromiumAsync();
+    }
+
+    /// <summary>
+    /// Well-known install locations, most-preferred first. Edge leads on Windows
+    /// because it is present on every supported build.
+    /// </summary>
+    private static IEnumerable<(string Name, string Path)> CandidateBrowsers()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
+            yield return ("Microsoft Edge", Path.Combine(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"));
+            yield return ("Microsoft Edge", Path.Combine(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"));
+            yield return ("Google Chrome", Path.Combine(programFiles, "Google", "Chrome", "Application", "chrome.exe"));
+            yield return ("Google Chrome", Path.Combine(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"));
+            yield return ("Google Chrome", Path.Combine(localAppData, "Google", "Chrome", "Application", "chrome.exe"));
+        }
+        else if (OperatingSystem.IsMacOS())
+        {
+            yield return ("Google Chrome", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+            yield return ("Microsoft Edge", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge");
+        }
+        else
+        {
+            yield return ("Google Chrome", "/usr/bin/google-chrome");
+            yield return ("Chromium", "/usr/bin/chromium");
+            yield return ("Chromium", "/usr/bin/chromium-browser");
+            yield return ("Microsoft Edge", "/usr/bin/microsoft-edge");
+        }
+    }
+
+    /// <summary>
+    /// Downloads Chromium on first use and returns its executable path. Throws
+    /// with a readable message if that fails.
+    /// </summary>
+    private static async Task<BrowserChoice> DownloadChromiumAsync()
     {
         // Cache Chromium per-user rather than next to the binary, so a rebuild
         // (or a clean) doesn't trigger a fresh download.
@@ -34,7 +85,7 @@ internal static class Helpers
 
         if (installed is null)
         {
-            Console.WriteLine($"No local Chromium found in '{fetcher.CacheDir}'. Downloading (first run only)...");
+            Console.WriteLine($"Downloading Chromium into '{cacheDir}' (first run only, several hundred MB)...");
             try
             {
                 installed = await fetcher.DownloadAsync();
@@ -42,7 +93,7 @@ internal static class Helpers
             catch (Exception ex)
             {
                 throw new InvalidOperationException(
-                    $"Could not download Chromium into '{fetcher.CacheDir}'. " +
+                    $"Could not download Chromium into '{cacheDir}'. " +
                     $"Check network access/proxy settings and disk space. Reason: {ex.Message}", ex);
             }
         }
@@ -52,10 +103,10 @@ internal static class Helpers
         {
             throw new InvalidOperationException(
                 $"Chromium build '{installed.BuildId}' is registered but its executable is missing at '{executable}'. " +
-                "Delete the cache directory and re-run to force a fresh download.");
+                $"Delete '{cacheDir}' and re-run to force a fresh download.");
         }
 
-        return executable;
+        return new BrowserChoice(executable, $"Chrome for Testing {installed.BuildId} (downloaded, unsigned)");
     }
 
     /// <summary>
@@ -219,3 +270,8 @@ internal static class Helpers
         return displayName.Length > 0 ? displayName : email;
     }
 }
+
+/// <summary>The browser chosen for rendering, plus a human-readable description of it.</summary>
+/// <param name="ExecutablePath">Full path to the browser executable.</param>
+/// <param name="Description">What to show the user, e.g. "Microsoft Edge (C:\...)".</param>
+internal sealed record BrowserChoice(string ExecutablePath, string Description);

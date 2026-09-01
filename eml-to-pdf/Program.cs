@@ -10,10 +10,13 @@ Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
 if (args.Length < 2 || args[0] is "-h" or "--help" or "/?")
 {
-    Console.WriteLine("Usage: eml-to-pdf <input-dir> <output-dir> [--recurse] [--parallel N]");
+    Console.WriteLine("Usage: eml-to-pdf <input-dir> <output-dir> [--recurse] [--parallel N] [--no-remote-content]");
     Console.WriteLine();
-    Console.WriteLine("  --recurse     also convert .msg files in sub-directories");
-    Console.WriteLine("  --parallel N  messages converted at once (default: processor count)");
+    Console.WriteLine("  --recurse             also convert .msg files in sub-directories");
+    Console.WriteLine("  --parallel N          messages converted at once (default: processor count)");
+    Console.WriteLine("  --no-remote-content   block all http(s) requests while rendering, so messages");
+    Console.WriteLine("                        cannot fetch tracking pixels or remote images. Use this");
+    Console.WriteLine("                        for suspicious or quarantined mail.");
     return 1;
 }
 
@@ -21,6 +24,7 @@ var inputDir = args[0];
 var outputDir = args[1];
 var recurse = false;
 var parallelism = Environment.ProcessorCount;
+var blockRemoteContent = false;
 
 for (var i = 2; i < args.Length; i++)
 {
@@ -28,6 +32,10 @@ for (var i = 2; i < args.Length; i++)
     {
         case "--recurse":
             recurse = true;
+            break;
+
+        case "--no-remote-content":
+            blockRemoteContent = true;
             break;
 
         case "--parallel":
@@ -65,16 +73,20 @@ if (files.Length == 0)
 
 Console.WriteLine($"Found {files.Length} .msg file(s). Converting with {parallelism} worker(s)...");
 
-string chromiumPath;
+BrowserChoice renderer;
 try
 {
-    chromiumPath = await Helpers.EnsureChromiumAsync();
+    renderer = await Helpers.ResolveBrowserAsync();
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine($"Chromium is unavailable, cannot render PDFs.\n{ex.Message}");
+    Console.Error.WriteLine($"No usable browser, cannot render PDFs.{Environment.NewLine}{ex.Message}");
     return 1;
 }
+
+Console.WriteLine($"Renderer: {renderer.Description}");
+if (blockRemoteContent)
+    Console.WriteLine("Remote content blocked: messages cannot reach the network.");
 
 var processed = 0;
 var succeeded = 0;
@@ -86,9 +98,14 @@ var stopwatch = Stopwatch.StartNew();
 await using var browser = await Puppeteer.LaunchAsync(new LaunchOptions
 {
     Headless = true,
-    ExecutablePath = chromiumPath,
-    // Keeps Chromium happy in containers and other low-/dev/shm environments.
-    Args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    ExecutablePath = renderer.ExecutablePath,
+    // Talk to the browser over a pipe rather than a remote-debugging port. A
+    // listening CDP port is how infostealers hijack browsers, so endpoint
+    // security watches for it; a pipe does the same job without opening one.
+    Pipe = true,
+    // NOTE: the browser sandbox is deliberately left ON. This renders untrusted
+    // HTML straight from email, which is exactly what the sandbox is for.
+    Args = ["--disable-dev-shm-usage"]
 });
 
 await Parallel.ForEachAsync(
@@ -98,7 +115,7 @@ await Parallel.ForEachAsync(
     {
         try
         {
-            var pdfPath = await ConvertAsync(browser, file, outputDir);
+            var pdfPath = await ConvertAsync(browser, file, outputDir, blockRemoteContent);
             Interlocked.Increment(ref succeeded);
             Report(file, Path.GetFileName(pdfPath));
         }
@@ -129,7 +146,7 @@ if (!failures.IsEmpty)
 return failed == 0 ? 0 : 1;
 
 // Parses one .msg and renders it to a PDF in the output directory.
-static async Task<string> ConvertAsync(IBrowser browser, string msgPath, string outputDir)
+static async Task<string> ConvertAsync(IBrowser browser, string msgPath, string outputDir, bool blockRemoteContent)
 {
     string html;
     using (var msg = new Storage.Message(msgPath))
@@ -140,6 +157,12 @@ static async Task<string> ConvertAsync(IBrowser browser, string msgPath, string 
     var pdfPath = Helpers.ReserveOutputPath(outputDir, Path.GetFileNameWithoutExtension(msgPath));
 
     await using var page = await browser.NewPageAsync();
+
+    if (blockRemoteContent)
+    {
+        await page.SetRequestInterceptionAsync(true);
+        page.Request += BlockRemoteRequests;
+    }
 
     // Emails are authored for screens; print stylesheets often hide content.
     await page.EmulateMediaTypeAsync(MediaType.Screen);
@@ -170,4 +193,28 @@ void Report(string msgPath, string outcome)
 {
     var n = Interlocked.Increment(ref processed);
     Console.WriteLine($"[{n}/{files.Length}] {Path.GetFileName(msgPath)} -> {outcome}");
+}
+
+// Lets the page build itself from the HTML we supplied, but refuses every trip
+// to the network, so a message can't phone home or pull a tracking pixel.
+static async void BlockRemoteRequests(object? sender, RequestEventArgs e)
+{
+    try
+    {
+        var url = e.Request.Url;
+        if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+            url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            await e.Request.AbortAsync();
+        }
+        else
+        {
+            await e.Request.ContinueAsync();
+        }
+    }
+    catch
+    {
+        // The page may already be closed or the request already handled.
+        // Either way there is nothing useful to do here.
+    }
 }
