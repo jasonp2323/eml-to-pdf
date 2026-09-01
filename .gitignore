@@ -1,0 +1,99 @@
+# ---------------------------------------------------------------------------
+# .NET / C# .gitignore
+#
+# Rule of thumb: commit SOURCE (.cs, .csproj, .sln) and never commit anything
+# the build regenerates. If you can get it back by running `dotnet build`,
+# `dotnet restore`, or `dotnet publish`, it belongs in here.
+# ---------------------------------------------------------------------------
+
+# --- Build output ----------------------------------------------------------
+# bin/ holds the compiled app, obj/ holds intermediate build state plus the
+# restored-package bookkeeping (project.assets.json). Both are 100% generated.
+bin/
+obj/
+
+# Some build setups write to these instead.
+[Dd]ebug/
+[Rr]elease/
+[Bb]uild/
+artifacts/
+
+# Platform-specific output folders.
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+
+# --- Publish output --------------------------------------------------------
+# `dotnet publish` output. The self-contained/single-file flavour is enormous
+# (tens of MB) because it bundles the .NET runtime -- never commit it.
+publish/
+publish-*/
+[Pp]ublish[Oo]utput/
+*.publishsettings
+*.pubxml.user
+
+# --- NuGet -----------------------------------------------------------------
+# Packages are restored from nuget.org on demand; the .csproj records which
+# ones you need, so the downloaded copies don't belong in the repo.
+packages/
+*.nupkg
+*.snupkg
+.nuget/
+
+# NOTE: do NOT ignore NuGet.config, global.json, or .config/dotnet-tools.json.
+# Those pin your build and SHOULD be committed.
+
+# --- JetBrains Rider / ReSharper -------------------------------------------
+# Rider keeps per-developer state (open tabs, window layout, caches) in here.
+.idea/
+*.iml
+*.sln.iml
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# --- Visual Studio ---------------------------------------------------------
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+
+# --- Visual Studio Code ----------------------------------------------------
+# Ignores personal settings but keeps shared launch/task definitions if you
+# ever add them deliberately.
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+
+# --- Tests and coverage ----------------------------------------------------
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+coverage*.json
+coverage*.xml
+coverage*.info
+
+# --- Build logs ------------------------------------------------------------
+*.binlog
+msbuild.log
+msbuild.err
+msbuild.wrn
+
+# --- Local run output ------------------------------------------------------
+# This tool writes failures.log (and PDFs) into whatever output directory you
+# point it at. These rules keep the repo clean if you aim it at the repo root
+# while testing.
+failures.log
+*.pdf
+*.msg
+
+# --- Crash dumps and OS clutter --------------------------------------------
+*.dmp
+.DS_Store
+Thumbs.db
+desktop.ini
