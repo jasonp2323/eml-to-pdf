@@ -50,7 +50,10 @@ eml-to-pdf <input-dir> <output-dir> [--recurse] [--parallel N] [--no-remote-cont
 | `<output-dir>`        | yes      | Where the PDFs are written. Created automatically if missing.      |
 | `--recurse`           | no       | Also convert `.msg` files in sub-directories.                      |
 | `--parallel N`        | no       | How many messages to convert at once. Defaults to your CPU count.  |
+| `--timeout SECONDS`   | no       | Budget per message for loading remote content and rendering. Default `30`. |
 | `--no-remote-content` | no       | Block every http(s) request while rendering. See [Remote content](#remote-content). |
+| `--skip-existing`     | no       | Leave messages already converted by an earlier run alone, so an interrupted batch can be resumed. |
+| `--recycle-after N`   | no       | Restart the browser every N messages. Default `15`. See [Browser recycling](#browser-recycling). |
 
 Run with `--help` (or no arguments) to print the same summary.
 
@@ -84,13 +87,25 @@ Each `Some Subject.msg` becomes `Some Subject.pdf` in the output directory:
 - **Body** — the HTML body is used when present; otherwise the plain-text body
   is rendered in a monospace block. A message with neither still produces a PDF
   containing just the header, rather than being silently skipped.
+- **Images** — every image the message carries is rendered. Attachments with a
+  Content-Id are inlined into the matching `cid:` reference in the body; any
+  image attachment the body never references is appended at the end under
+  "Attached images" so nothing is dropped. Because they are embedded as data
+  URIs, they need no network access and still render under
+  `--no-remote-content`.
 
 ### File naming
 
 - **Collisions** are resolved by appending a counter: `Report.pdf`,
   `Report (2).pdf`, `Report (3).pdf`. This is expected — Outlook exports
   routinely produce many files with the same subject line. It also applies when
-  you re-run into an output folder that already has results in it.
+  you re-run into an output folder that already has results in it, so a plain
+  re-run duplicates rather than replaces.
+- **`--skip-existing`** makes a re-run resumable instead: a message whose PDF was
+  produced by an *earlier* run is left alone, while two messages sharing a base
+  name *within* the current run still get numbered normally. Note that it skips
+  on filename alone — it cannot tell a stale PDF from a current one, so clear the
+  output directory instead when the tool itself has changed.
 - **Illegal characters** in the subject are replaced with `_`, and long names are
   truncated to 100 characters so the full path stays under Windows' `MAX_PATH`
   limit.
@@ -121,6 +136,30 @@ endpoint you almost certainly want that fallback never to fire.
 
 Whichever is used, the browser launches with a fresh temporary profile. It never
 reads or writes your real Edge/Chrome profile, cookies, or history.
+
+### Browser recycling
+
+Chromium's memory grows steadily as it renders these documents and is never handed
+back, even though every page is closed after use. Measured over 80 renders of a
+200-page reply chain through a single instance:
+
+| After | Browser process tree |
+| ----- | -------------------- |
+| 10 messages | 1.6 GB |
+| 40 messages | 4.6 GB |
+| 80 messages | 7.2 GB |
+
+On a machine with room to spare this only slows things down. On a typical
+workstation it exhausts memory partway through a large batch, at which point the
+browser stops responding and **every remaining message fails on a timeout** — a
+run that converts the first 20 files and then fails the other 100 is this, not a
+problem with the files. The giveaway is that a message which failed in the batch
+converts fine on its own.
+
+So the run is processed in chunks with a fresh browser per chunk, which holds peak
+memory flat at around 1 GB regardless of batch size. `--recycle-after N` sets the
+chunk size; a restart costs about a second. Lower it if conversions still time out
+partway through, raise it if you have memory to spare and want the throughput.
 
 ### Security posture
 
@@ -270,12 +309,20 @@ eml-to-pdf/
 
 ## Known limitations
 
-- **Attachments are out of scope.** They are neither extracted nor listed in the
-  PDF. Embedded images referenced by `cid:` will therefore appear broken.
+- **Non-image attachments are out of scope.** A PDF, spreadsheet, or document
+  attached to the message is neither extracted nor listed. Images are rendered —
+  see [What you get](#what-you-get).
+- **TIFF images do not render.** Chromium cannot paint them, so a faxed or
+  scanned TIFF attachment is skipped rather than shown broken. Everything else
+  Chromium supports (PNG, JPEG, GIF, BMP, WebP, SVG, AVIF) renders.
 - **`.eml` files are ignored.** MsgReader can parse them, so adding support is a
   small change to the file search and the parsing call.
 - **Remote images** are fetched from the internet if the message links to them,
-  unless you pass `--no-remote-content`. Page loads time out after 30 seconds.
+  unless you pass `--no-remote-content`. They get a 10-second grace period, after
+  which the PDF is produced without them — a slow or unreachable image costs you
+  that image, never the message. On mail full of tracking pixels behind a proxy
+  that drops blocked requests, that grace period is paid per message, so
+  `--no-remote-content` is roughly ten times faster as well as safer.
 - Messages that are not really emails (contacts, appointments, or files that
   merely have a `.msg` extension) will fail and be logged.
 

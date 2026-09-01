@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using MsgReader.Outlook;
 using PuppeteerSharp;
 
@@ -14,6 +15,8 @@ internal static class Helpers
 
     private static readonly object PathGate = new();
     private static readonly HashSet<string> ReservedPaths = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> PreExistingPdfs = new(StringComparer.OrdinalIgnoreCase);
+    private static bool SkipExisting;
 
     /// <summary>
     /// Picks the browser used for rendering. An already-installed Edge/Chrome is
@@ -151,7 +154,7 @@ internal static class Helpers
     /// on collision. Reservations are tracked in-process so parallel workers can't
     /// pick the same name before either has written its file.
     /// </summary>
-    public static string ReserveOutputPath(string outputDir, string baseName)
+    public static string? ReserveOutputPath(string outputDir, string baseName)
     {
         var safe = SanitizeFileName(baseName);
 
@@ -160,13 +163,42 @@ internal static class Helpers
             for (var i = 1; ; i++)
             {
                 var candidate = Path.Combine(outputDir, i == 1 ? $"{safe}.pdf" : $"{safe} ({i}).pdf");
-                if (!ReservedPaths.Contains(candidate) && !File.Exists(candidate))
+
+                // Already claimed by another message in this run; try the next number.
+                if (ReservedPaths.Contains(candidate))
+                    continue;
+
+                // Left over from an earlier run. Consume the slot so a second message
+                // with this same base name moves on to the next number rather than
+                // colliding, and tell the caller to skip this one.
+                if (SkipExisting && PreExistingPdfs.Contains(candidate))
                 {
                     ReservedPaths.Add(candidate);
-                    return candidate;
+                    return null;
                 }
+
+                if (File.Exists(candidate))
+                    continue;
+
+                ReservedPaths.Add(candidate);
+                return candidate;
             }
         }
+    }
+
+    /// <summary>
+    /// Snapshots the PDFs already in the output directory so --skip-existing can tell
+    /// "converted by an earlier run" from "another message in this run wants this
+    /// name". Must be called before conversion starts.
+    /// </summary>
+    public static void PrepareOutputDirectory(string outputDir, bool skipExisting)
+    {
+        SkipExisting = skipExisting;
+        if (!skipExisting)
+            return;
+
+        foreach (var path in Directory.EnumerateFiles(outputDir, "*.pdf", SearchOption.TopDirectoryOnly))
+            PreExistingPdfs.Add(path);
     }
 
     /// <summary>
@@ -224,15 +256,26 @@ internal static class Helpers
     public static string BuildHtml(Storage.Message msg)
     {
         var header = BuildHeader(msg);
+        var images = CollectImages(msg);
+        var referenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         var bodyHtml = msg.BodyHtml;
         if (!string.IsNullOrWhiteSpace(bodyHtml))
-            return InjectHeader(bodyHtml, PrintNormalizeCss + header);
+        {
+            var withImages = InlineCidReferences(bodyHtml, images, referenced);
+            var appendix = BuildImageAppendix(images, referenced);
+            return InsertBeforeBodyEnd(
+                InjectHeader(withImages, PrintNormalizeCss + header),
+                appendix);
+        }
 
         var bodyText = msg.BodyText;
         var body = string.IsNullOrWhiteSpace(bodyText)
             ? "<p style=\"color:#888;font-style:italic\">(no message body)</p>"
             : $"<pre style=\"white-space:pre-wrap;overflow-wrap:break-word;font-family:Consolas,'Courier New',monospace;font-size:12px;margin:0\">{WebUtility.HtmlEncode(bodyText)}</pre>";
+
+        // No HTML body, so nothing can reference an image: show every one of them.
+        var allImages = BuildImageAppendix(images, referenced);
 
         return $"""
                 <!DOCTYPE html>
@@ -241,9 +284,147 @@ internal static class Helpers
                 <body style="font-family:'Segoe UI',Arial,sans-serif;font-size:13px;color:#000">
                 {header}
                 {body}
+                {allImages}
                 </body>
                 </html>
                 """;
+    }
+
+    /// <summary>
+    /// Every image the message carries, as a base64 data URI. Inlining them means
+    /// they render with no network access at all, so embedded images still appear
+    /// under --no-remote-content.
+    /// </summary>
+    private static List<EmbeddedImage> CollectImages(Storage.Message msg)
+    {
+        var images = new List<EmbeddedImage>();
+
+        foreach (var item in msg.Attachments)
+        {
+            // Attachments may also be nested messages; those are not images.
+            if (item is not Storage.Attachment attachment)
+                continue;
+
+            var data = attachment.Data;
+            if (data is null || data.Length == 0)
+                continue;
+
+            var mime = ResolveImageMime(attachment.MimeType, attachment.FileName);
+            if (mime is null)
+                continue;
+
+            images.Add(new EmbeddedImage(
+                NormalizeContentId(attachment.ContentId),
+                attachment.FileName ?? "image",
+                $"data:{mime};base64,{Convert.ToBase64String(data)}"));
+        }
+
+        return images;
+    }
+
+    /// <summary>Image types Chromium can actually paint. Anything else is skipped.</summary>
+    private static string? ResolveImageMime(string? mimeType, string? fileName)
+    {
+        var extension = Path.GetExtension(fileName ?? string.Empty).ToLowerInvariant();
+
+        var byExtension = extension switch
+        {
+            ".png" => "image/png",
+            ".jpg" or ".jpeg" or ".jfif" => "image/jpeg",
+            ".gif" => "image/gif",
+            ".bmp" => "image/bmp",
+            ".webp" => "image/webp",
+            ".svg" => "image/svg+xml",
+            ".ico" => "image/x-icon",
+            ".avif" => "image/avif",
+            _ => null
+        };
+
+        if (byExtension is not null)
+            return byExtension;
+
+        // Fall back to what the message claims, provided Chromium can render it.
+        if (!string.IsNullOrWhiteSpace(mimeType) &&
+            mimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) &&
+            !mimeType.Contains("tiff", StringComparison.OrdinalIgnoreCase))
+        {
+            return mimeType;
+        }
+
+        return null;
+    }
+
+    /// <summary>Content-Ids arrive wrapped in angle brackets more often than not.</summary>
+    private static string? NormalizeContentId(string? contentId)
+    {
+        var id = contentId?.Trim().Trim('<', '>').Trim();
+        return string.IsNullOrEmpty(id) ? null : id;
+    }
+
+    /// <summary>
+    /// Swaps every "cid:..." reference for the matching attachment's data URI, and
+    /// records which images were consumed so the appendix can show the rest.
+    /// </summary>
+    private static string InlineCidReferences(
+        string html, List<EmbeddedImage> images, HashSet<string> referenced)
+    {
+        if (images.Count == 0 || html.IndexOf("cid:", StringComparison.OrdinalIgnoreCase) < 0)
+            return html;
+
+        return Regex.Replace(
+            html,
+            @"cid:([^""'\s>)\\]+)",
+            match =>
+            {
+                var id = Uri.UnescapeDataString(match.Groups[1].Value).Trim();
+
+                var image = images.FirstOrDefault(i =>
+                                string.Equals(i.ContentId, id, StringComparison.OrdinalIgnoreCase))
+                            ?? images.FirstOrDefault(i =>
+                                string.Equals(i.FileName, id, StringComparison.OrdinalIgnoreCase));
+
+                if (image is null)
+                    return match.Value;
+
+                referenced.Add(image.Key);
+                return image.DataUri;
+            },
+            RegexOptions.IgnoreCase);
+    }
+
+    /// <summary>
+    /// Renders any image the body never referenced, so an attached screenshot or
+    /// scan still appears in the PDF instead of being silently dropped.
+    /// </summary>
+    private static string BuildImageAppendix(List<EmbeddedImage> images, HashSet<string> referenced)
+    {
+        var remaining = images.Where(i => !referenced.Contains(i.Key)).ToList();
+        if (remaining.Count == 0)
+            return string.Empty;
+
+        var sb = new StringBuilder();
+        sb.Append("<div style=\"margin-top:24px;padding-top:10px;border-top:1px solid #bbb;font-family:'Segoe UI',Arial,sans-serif\">");
+        sb.Append($"<p style=\"font-size:12px;font-weight:600;color:#555;margin:0 0 10px 0\">Attached images ({remaining.Count})</p>");
+
+        foreach (var image in remaining)
+        {
+            sb.Append("<figure style=\"margin:0 0 16px 0;page-break-inside:avoid\">");
+            sb.Append($"<img src=\"{image.DataUri}\" style=\"max-width:100%;height:auto\" alt=\"\">");
+            sb.Append($"<figcaption style=\"font-size:11px;color:#666;margin-top:4px\">{WebUtility.HtmlEncode(image.FileName)}</figcaption>");
+            sb.Append("</figure>");
+        }
+
+        sb.Append("</div>");
+        return sb.ToString();
+    }
+
+    private static string InsertBeforeBodyEnd(string html, string fragment)
+    {
+        if (fragment.Length == 0)
+            return html;
+
+        var close = html.LastIndexOf("</body>", StringComparison.OrdinalIgnoreCase);
+        return close >= 0 ? html.Insert(close, fragment) : html + fragment;
     }
 
     /// <summary>
@@ -323,3 +504,13 @@ internal static class Helpers
 /// <param name="ExecutablePath">Full path to the browser executable.</param>
 /// <param name="Description">What to show the user, e.g. "Microsoft Edge (C:\...)".</param>
 internal sealed record BrowserChoice(string ExecutablePath, string Description);
+
+/// <summary>An image carried by the message, ready to drop straight into the HTML.</summary>
+/// <param name="ContentId">Its Content-Id, when the message gave it one.</param>
+/// <param name="FileName">Attachment file name, used as the caption.</param>
+/// <param name="DataUri">Complete "data:image/...;base64,..." value.</param>
+internal sealed record EmbeddedImage(string? ContentId, string FileName, string DataUri)
+{
+    /// <summary>Stable identity for de-duplication; Content-Id when present, else the name.</summary>
+    public string Key => ContentId ?? FileName;
+}
