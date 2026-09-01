@@ -173,13 +173,61 @@ internal static class Helpers
     /// Builds the HTML document handed to Chromium: the message header block
     /// followed by the HTML body, the plain-text body, or nothing at all.
     /// </summary>
+    /// <summary>
+    /// Rules injected into every message to undo two things Outlook/Word HTML does
+    /// that survive fine in a mail client but fall apart when paginated into a PDF.
+    /// Injected at the top of &lt;body&gt;, so it comes after the message's own
+    /// &lt;head&gt; styles and wins on document order as well as on !important.
+    /// </summary>
+    private const string PrintNormalizeCss = """
+        <style>
+        /* Word exports declare a named page -- "@page WordSection1" plus
+           "div.WordSection1 { page: WordSection1 }". Chromium honours named pages
+           and breaks to a fresh sheet whenever the page name changes, which is why
+           the header block ends up alone on page 1 with the body starting on page 2.
+           Forcing every element back onto the default page removes that break. */
+        * { page: auto !important; }
+
+        /* Reply chains nest one quote wrapper per level, and the indent is
+           cumulative. Twenty replies deep the text column is a few pixels wide and
+           wraps one character per line. Flatten every level to the same shallow
+           indent so depth costs nothing. */
+        blockquote {
+            margin-left: 0 !important;
+            margin-right: 0 !important;
+            padding-left: 0.7em !important;
+            border-left: 2px solid #ddd !important;
+        }
+
+        /* Wrappers other clients use for the same job. */
+        .gmail_quote, .gmail_quote_container, .protonmail_quote, .yahoo_quoted {
+            margin-left: 0 !important;
+            padding-left: 0 !important;
+            border-left: 0 !important;
+        }
+
+        /* A quoted chain that nests layout tables collapses the same way. Let the
+           innermost content keep a usable width rather than inheriting a squeezed
+           one from its ancestors. */
+        blockquote table, blockquote td, blockquote div {
+            width: auto !important;
+            min-width: 0 !important;
+            margin-left: 0 !important;
+        }
+
+        /* Long URLs and unbroken tokens must not force a horizontal overflow that
+           narrows everything else. */
+        body { overflow-wrap: break-word; }
+        </style>
+        """;
+
     public static string BuildHtml(Storage.Message msg)
     {
         var header = BuildHeader(msg);
 
         var bodyHtml = msg.BodyHtml;
         if (!string.IsNullOrWhiteSpace(bodyHtml))
-            return InjectHeader(bodyHtml, header);
+            return InjectHeader(bodyHtml, PrintNormalizeCss + header);
 
         var bodyText = msg.BodyText;
         var body = string.IsNullOrWhiteSpace(bodyText)
